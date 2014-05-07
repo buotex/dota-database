@@ -1,6 +1,5 @@
 import os
 import requests
-import json
 #from xml.dom.minidom import parseString
 from pyparsing import *
 from bs4 import BeautifulSoup as bs
@@ -11,6 +10,16 @@ import sys
 import postgres
 import psycopg2
 import time
+import json
+import simplejson
+import jsonschema
+
+import numpy
+import scipy
+import sklearn
+import datetime
+from dateutil.relativedelta import relativedelta
+
 class PostgresWrapper(postgres.Postgres):
     def run(self, sql, parameters = None, *args,**kwargs):
         try:
@@ -20,14 +29,65 @@ class PostgresWrapper(postgres.Postgres):
             return 1
         except:
             raise
-db = PostgresWrapper("postgres://bxu@localhost/dota")
+db = PostgresWrapper("dbname='dota' user='bxu' host='localhost'")
 
 STEAM_API_KEY = os.environ["STEAMODD_API_KEY"]
 PARAMS = {"key" : STEAM_API_KEY}
 
+
+class Winrate(object):
+    sort = {
+        "winrate": { 
+            "key": lambda x: (x[0], x[1]),
+            "reverse": True
+            },
+        "hero_name": {
+            "key": lambda x: x[4]
+        }
+    }
+
+
+def getDates(delta):
+    after = int(((datetime.datetime.today() + delta) - datetime.datetime(1970,1,1)).total_seconds())
+    before= int((datetime.datetime.today() - datetime.datetime(1970,1,1)).total_seconds())
+    return [after, before]
+
+
+def createValueString(values):
+    return (', '.join(len(values) * ['{}'])).format(*values)
+
+#def createArrayString(values):
+#    #return "\'\{" + ', '.join(len(values) * ['{}']) \}\'".format()
+
 def createInsert(table, values):
-    runstring = 'INSERT INTO {}'.format(table)+' VALUES (' + (','.join(len(values) * ['{}'])).format(*values) + ')'
+    runstring = 'INSERT INTO {}'.format(table)+' VALUES (' + createValueString(values) + ')'
     return runstring
+
+def wrapString(string):
+    return "'{}'".format(string)
+
+def createNamedInsert(table, **kwargs):
+    runstring = 'INSERT INTO {} '.format(table) +\
+    '(' + createValueString(kwargs.keys()) + ')' +\
+    ' VALUES (' + \
+     createValueString(kwargs.values()) + ')'
+    return runstring
+
+def createWhere(key, val):
+    return "{} = {}".format(key, val)
+
+def createWhereStrings(**kwargs):
+    wherestring = 'WHERE ' + " AND ".join([createWhere(key, val) for key, val in kwargs.items()])
+    return wherestring
+
+def createNamedUpdate(table, where, **kwargs):
+    runstring = 'UPDATE {} '.format(table) +\
+    'SET (' + createValueString(kwargs.keys()) + ')' +\
+    ' = (' + \
+     createValueString(kwargs.values()) + ') ' + createWhereStrings(**where)
+
+    return runstring
+
 
 def filterString(string):
     string = string.decode('unicode-escape').decode('ascii', 'ignore')
@@ -42,10 +102,14 @@ def getJavascript(url, **kwargs):
 
 def getJson(url, **kwargs):
     request = requests.get(url, **kwargs)
-    json = request.json()
+    try:
+        json = request.json()
+    except simplejson.decoder.JSONDecodeError:
+        print "Could not decode \n{}".format(request.text)
+        raise
     return json
         
-def getSoup(url, **kwargs):
+def getText(url, **kwargs):
     request = requests.get(url, **kwargs)
     soup = bs(request.text.encode('utf-8'))
     return soup
@@ -54,7 +118,14 @@ class pyparseHelper:
 
     keyval = quotedString + Suppress(":") + quotedString
     idSpec = Suppress(Literal('g_rgProfileData = '))  +Suppress('{') + delimitedList(keyval) + Suppress('}')
+    heroNameSpec = Suppress(Literal('\"url\"')) + quotedString
+    heroAliasesSpec = Suppress(Literal('\"NameAliases\"')) + QuotedString('"')
+    heroIdSpec = Suppress(Literal('\"HeroID\"')) + quotedString
     quotedString.setParseAction(removeQuotes)
+
+
+
+
 
 def pairwise(iterable):
     "s -> (s0,s1), (s1,s2), (s2, s3), ..."
@@ -138,12 +209,13 @@ def getMatchHistory(steamid, **kwargs):
     STEAM_HISTORY_URL = "https://api.steampowered.com/IDOTA2Match_570/GetMatchHistory/V001"
     params = PARAMS.copy()
     params["account_id"] = steamid
+    #params["min_players"] = 10
     params.update(kwargs)
     matchlist = getJson(STEAM_HISTORY_URL, params = params)
 
     return matchlist["result"]["matches"]
 
-def filterMatches(matchlist):
+#def filterMatches(matchlist):
     
 
 
@@ -152,7 +224,13 @@ def insertMatch(match):
     starttime = match["start_time"] 
     players = match["players"]
     runstrings = []
-    runstrings.append(createInsert("match_detail", [matchid,starttime]))
+    runstring = createInsert("match_detail", [matchid, starttime])
+    failed = db.run(runstring)
+    if failed:
+        return 1
+
+
+
     
     for player in players:
         try:
@@ -162,7 +240,7 @@ def insertMatch(match):
             print playerdata
             go.db
             
-    if len(runstrings) == 11:
+    if len(runstrings) == 10:
         for s in runstrings:
             try:
                 failed = db.run(s)
@@ -174,13 +252,204 @@ def insertMatch(match):
             except:
                 go.db
 
+def getOldestGameTime(steamid):
+    qstring = 'select min(start_time) from match_detail where match_id \
+    in (select match_id from matches where player_id = {})'.format(steamid)
+    result = db.one(qstring)
+    return result 
+
+def getMatchDetails(matchid):
+    STEAM_MATCH_URL = "https://api.steampowered.com/IDOTA2Match_570/GetMatchDetails/V001"
+    params = PARAMS.copy()
+    params["match_id"] = matchid
+    matchdetail = getJson(STEAM_MATCH_URL, params = params)
+
+    return matchdetail["result"]
+
+def getAllMatches(account_id):
+    t = 0
+    while 1:
+        matches = getMatchHistory(account_id, date_max = t)
+        t = matches[-1]["start_time"]
+        #t = getOldestGameTime(account_id)
+        if len(matches) < 100:
+            break
+        for match in matches:
+            insertMatch(match)
+
+def insertMatchDetails(match):
+    #backup = open("matchdetail", 'w')
+    #json.dump(match, backup)
+    
+    detailparams = {}
+    where = {"match_id" : match["match_id"]}
+    for p in ["start_time", "radiant_win", "duration", "tower_status_radiant", "barracks_status_radiant",
+              "barracks_status_dire", "game_mode"]:
+        detailparams[p] = match[p]    
+
+    dstring = createNamedUpdate("match_detail", where,  **detailparams)
+    db.run(dstring)
+
+    for p in match["players"]:
+        where = {"match_id": match["match_id"], "player_id": p["account_id"], "hero_id" : p["hero_id"]}
+        playerparams = {}
+        for i in ['gold_spent', 'gold', 'deaths', 'hero_damage',
+                  'last_hits', 'denies',
+                  'tower_damage', 'xp_per_min', 'kills',
+                  'hero_healing', 'assists', 'gold_per_min',
+                  'level', 'item_4', 'item_5', 'item_2', 'item_3',
+                  'item_0', 'item_1']:
+            playerparams[i] = p[i]
+        
+        playerparams.update(where)
+        pstring = createNamedInsert("played", **playerparams)
+        db.run(pstring)
+
+    
 
 
+
+def fillMatchDetails():
+    records = db.all('select match_id from match_detail where radiant_win is NULL')
+    print "{} new matches found".format(len(records))
+    counter = 0
+    for record in records:
+        details = getMatchDetails(record)
+        insertMatchDetails(details)
+        print "{}/{} done".format(counter, len(records))
+        counter = counter + 1
+        
+
+def insertHeroIds():
+    source = "https://raw.github.com/dotabuff/d2vpk/master/dota_pak01/scripts/npc/npc_heroes.txt"
+    herolist = getText(source)
+    heronames = getTokens(pyparseHelper.heroNameSpec, herolist)
+    heroids = getTokens(pyparseHelper.heroIdSpec, herolist)
+    #heroaliases = getTokens(pyparseHelper.heroAliasesSpec, herolist)
+    
+    def splitAlias(alias):
+        pat = re.findall('[A-z]+', alias)
+        return pat
+        
+    heronames.remove("Centaur Warchief")
+
+    for name, id in zip(heronames, heroids):
+        #aliases = splitAlias(alias)
+        #aliasstring= "\'{" + createValueString(aliases) + "}\'"
+        runstring = createInsert('heros', [int(id), wrapString(name)])
+        db.run(runstring)
+
+def getWinrate(records, **kwargs):
+    try:
+        if kwargs['intime']:
+            queryrecords = [record[0] for record in records]
+            recordstring = "'{" + createValueString(queryrecords) + "}'"
+            after = kwargs['intime'][0]
+            before = kwargs['intime'][1]
+            valid = db.all('SELECT * from intime({},{},{})'.format(recordstring, after, before))
+            records = [r for r,v in zip(records,valid) if v]
+    except:
+        pass
+
+    numMatches = len(records)
+    numWins = len([record for record in records if record[1] == record[2]])
+    numLosses = numMatches - numWins
+    try:
+        winrate = float(numWins * 100) / numMatches
+    except:
+        winrate = 0
+    
+    return [winrate, numWins, numLosses]
+
+def checkWinrateTuples(players, hero_involved = None, hero_same_team = True, **kwargs):
+    personastring = "\'{" + createValueString(players) + "}\'"
+
+    if not hero_involved:
+        querystring = "Select * from played_as_team({})".format(personastring)
+    else:
+        querystring = "Select * from played_as_team_with_hero({}, '{}')".format(personastring, hero_involved)
+    records = db.all(querystring)
+
+    herostring = ""
+    if hero_involved:
+        if hero_same_team:
+            herostring = " with {}".format(hero_involved)
+            records = [record for record in records if record[1] == record[3]]
+        else:
+            herostring = " against {}".format(hero_involved)
+            records = [record for record in records if record[1] == (not record[3])]
+    
+    descstring = ", ".join(players) + herostring
+    winrate, numWins, numLosses = getWinrate(records, **kwargs)
+    return [winrate, numWins, numLosses, descstring, hero_involved]
+
+def checkWinrate(players, hero_involved = None, hero_same_team = True, **kwargs):
+
+    result = checkWinrateTuples(players, hero_involved, hero_same_team) 
+
+    retstring = "Overall Winrate for {}: {:.02f}%, ({} - {})".format(result[3], result[0],result[1],result[2])
+
+    return retstring
+
+def checkWinrateOnHeroTuples(player, hero_name, played_with = None, **kwargs):
+    played_with_string = "{" + createValueString(played_with) + "}"
+    runstring = "select * from played_as_hero_with_team('{}', '{}','{}')".format(player, hero_name, played_with_string)
+    records = db.all(runstring)
+
+    winrate, numWins, numLosses = getWinrate(records, **kwargs)
+    descstring = "{} on {} with ".format(player, hero_name) + ", ".join(played_with)
+    return [winrate, numWins, numLosses, descstring, hero_name]
+
+def checkWinrateOnHero(player, hero_name, played_with = None, **kwargs):
+    result = checkWinrateOnHeroTuples(player, hero_name, played_with, **kwargs)
+
+    retstring = "Overall Winrate for {}: {:.02f}%, ({} - {})".format(result[3], result[0], result[1], result[2])
+    return retstring 
+
+
+def checkWinrateOnAllHerosWithPlayers(player, played_with = None, key = Winrate.sort["winrate"], **kwargs):
+    hero_ids = db.all('select hero_id from heros')
+    hero_names = db.all('select hero_name from heros')
+    
+    results = []
+    for name in hero_names:
+        results.append(checkWinrateOnHeroTuples(player, name.lower(), played_with, **kwargs))
+    results = sorted(results, **key)
+    for result in results:
+        retstring = "Overall Winrate for {}: {:.02f}%, ({} - {})".format(result[3], result[0], result[1], result[2])
+        if result[1] + result[2] > 0:
+            print retstring 
+    return results
+
+
+def checkWinrateAllHeros(players, hero_same_team = True, key = Winrate.sort['winrate'], **kwargs):
+    hero_ids = db.all('select hero_id from heros')
+    hero_names = db.all('select hero_name from heros')
+    
+    results = []
+    for name in hero_names:
+        results.append(checkWinrateTuples(players, name.lower(), hero_same_team, **kwargs))
+    results = sorted(results, **key)
+    for result in results:
+        retstring = "Overall Winrate for {}: {:.02f}%, ({} - {})".format(result[3], result[0], result[1], result[2])
+        if result[1] + result[2] > 0:
+            print retstring 
+    return results
+    
+def rankHeros():
+    gpm = db.all('SELECT hero_name, avg(gold_per_min) from played natural join heros group by hero_id, hero_name')
+    gpm = sorted(gpm, key = lambda x: x[1])
+    gold = [float(record[1]) for record in gpm] 
+    hist = numpy.histogram(gold, bins = 5)
+    go.db
+
+
+    
 
 if  __name__ == "__main__":
     #bit64 = stringToSteamId("STEAM_0:0:23599837")
     #bit64 = vanityToSteamId("rainvargus")
-    account_id = db.one("select player_id from players where persona = 'rainvargus'")
+    account_id = db.one("select player_id from players where LOWER(persona) = 'rainvargus'")
     #print bit64
     #getNameFrom64(bit64)
     #print getNameFrom64(76561198049183649)
@@ -190,6 +459,34 @@ if  __name__ == "__main__":
     
     #insertPlayers(friends[57:])
      
-    matches = getMatchHistory(account_id)
-    for match in matches:
-        insertMatch(match)
+    #matches = getMatchHistory(account_id)
+    #for match in matches:
+    #    insertMatch(match)
+    #t = getOldestGameTime(account_id)
+    #matchid = db.one("select match_id from match_detail where start_time = {}".format(t))
+    #print t
+    #print matchid
+    #matchdetails = getMatchDetails(matchid)
+    #print matchdetails
+    #getAllMatches(account_id)
+    #matches = getMatchHistory(account_id, date_max = 1349382647)
+    #fillMatchDetails()
+    #go.db
+    #print createNamedInsert("matches", asdf = "bla", blub = 3)
+    #print createWhereStrings( asdf = "bla", blub = 3)
+    #insertHeroIds()
+    #print createValueString(["rainvargus", "schatten"])
+    print checkWinrate(['rainvargus', 'schatten'], 'drow', False)
+    #print checkWinrate(['rainvargus', 'chroniko'], 'outworld_devourer', True)
+    #print checkWinrate(['Fire-storm' ], 'Phantom_Assassin')
+    #results = checkWinrateAllHeros([ 'rainvargus', 'Fire-storm'], True)
+    #print results
+    #print checkWinrateOnAllHerosWithPlayers('schatten', ['rainvargus', ], key = Winrate.sort['hero_name'])
+    #checkWinrateOnAllHerosWithPlayers('rainvargus', [], key = Winrate.sort['hero_name'])
+    #checkFarmRateOnAllHerosWithPlayers('schatten', ['rainvargus'])
+    #print checkWinrateOnHero('rainvargus', 'templar_assassin', ['chroniko'])
+    #rankHeros()
+    
+    
+    
+    #checkWinrateOnAllHerosWithPlayers('rainvargus', [], intime = getDates(relativedelta(months = -6)))

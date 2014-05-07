@@ -71,7 +71,7 @@ CREATE OR REPLACE FUNCTION findmatches(personas text[] ) RETURNS table (match_id
     AS $$ SELECT match_id, persona, slot, hero_id from matches NATURAL JOIN players where LOWER(persona) = ANY(personas) $$
         LANGUAGE SQL;
 
-select * from findmatches('{schatten}')
+select * from findmatches('{rainvargus, schatten}')
 
 
 select m.match_id, radiant_win, m.slot, p.slot from 
@@ -155,14 +155,12 @@ select * from played_as_hero_with_team('rainvargus', 'abaddon', '{}');
 
 select * from players;
 
-select (slot < 100) = radiant_win as WON, match_id from matches natural join (
+select (slot < 100) = radiant_win as WON 
 select * from match_detail natural join (
 select distinct match_id from matches where match_id >= 562908933 and match_id not in (
 select match_id from matches where player_id in (
 select m2.player_id from matches m join matches m2 on m.match_id = m2.match_id where m.player_id <> m2.player_id and m2.player_id <>4294967295 
 and
-m.player_id in  (select player_id from players where lower(persona)='rainvargus' and m.match_id >= 562908933) group by m2.player_id having count(*) >=2)
+m.player_id in  (select player_id from players where lower(persona)='rainvargus' and m.match_id >= 562908933) group by m2.player_id having count(*) >2)
 )
-) m2 )m3
-where player_id in (select player_id from players where lower(persona) = 'rainvargus') order by match_id desc
-
+) m2
