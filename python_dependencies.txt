@@ -1,0 +1,10 @@
+requests
+pyparsing
+beautifulsoup4
+postgres
+simplejson
+simplejson
+jsonschema
+numpy
+scipy
+python-dateutil
