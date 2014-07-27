@@ -7,8 +7,6 @@ import itertools
 import re
 import sys
 
-import postgres
-import psycopg2
 import time
 import json
 import simplejson
@@ -20,19 +18,12 @@ import sklearn
 import datetime
 from dateutil.relativedelta import relativedelta
 
-class PostgresWrapper(postgres.Postgres):
-    def run(self, sql, parameters = None, *args,**kwargs):
-        try:
-            postgres.Postgres.run(self, sql, parameters, *args, **kwargs)
-            return 0
-        except psycopg2.IntegrityError:
-            return 1
-        except:
-            raise
-db = PostgresWrapper("dbname='dota' user='bxu' host='localhost'")
+from dbdriver import *
 
 STEAM_API_KEY = os.environ["STEAMODD_API_KEY"]
 PARAMS = {"key" : STEAM_API_KEY}
+
+
 
 
 class Winrate(object):
@@ -193,7 +184,7 @@ def getFriendList(steamid64):
     return [int(friend["steamid"]) for friend in friends]
 
 
-def insertPlayers(steamidList):
+def insertPlayers(db, steamidList):
     for id in steamidList:
         try:
             persona = getPersonaFrom64(id)
@@ -202,30 +193,21 @@ def insertPlayers(steamidList):
         persona = "\'" + persona +"\'"
         steamid32 = steamIdTo32(id)
 
-        db.run(createInsert("players", [steamid32, persona]))
+        db.execute(createInsert("players", [steamid32, persona]))
 
 
-def getMatchHistory(steamid, **kwargs):
-    STEAM_HISTORY_URL = "https://api.steampowered.com/IDOTA2Match_570/GetMatchHistory/V001"
-    params = PARAMS.copy()
-    params["account_id"] = steamid
-    #params["min_players"] = 10
-    params.update(kwargs)
-    matchlist = getJson(STEAM_HISTORY_URL, params = params)
-
-    return matchlist["result"]["matches"]
 
 #def filterMatches(matchlist):
     
 
 
-def insertMatch(match):
+def insertMatch(db, match):
     matchid = match["match_id"]
     starttime = match["start_time"] 
     players = match["players"]
     runstrings = []
     runstring = createInsert("match_detail", [matchid, starttime])
-    failed = db.run(runstring)
+    failed = db.execute(runstring)
     if failed:
         return 1
 
@@ -238,19 +220,18 @@ def insertMatch(match):
             runstrings.append( createInsert("matches", [matchid,]  + playerdata) )
         except:
             print playerdata
-            go.db
             
     if len(runstrings) == 10:
         for s in runstrings:
             try:
-                failed = db.run(s)
+                failed = db.execute(s)
                 if failed:
                     deletestring = "DELETE from match_detail where match_id = {}".format(matchid)
-                    db.run(deletestring)
+                    db.execute(deletestring)
                     break
                     
-            except:
-                go.db
+            except Exception as e:
+                print e
 
 def getOldestGameTime(steamid):
     qstring = 'select min(start_time) from match_detail where match_id \
@@ -266,16 +247,37 @@ def getMatchDetails(matchid):
 
     return matchdetail["result"]
 
-def getAllMatches(account_id):
-    t = 0
+def _getMatchHistory(steamid, **kwargs):
+    STEAM_HISTORY_URL = "https://api.steampowered.com/IDOTA2Match_570/GetMatchHistory/V001"
+    params = PARAMS.copy()
+    params["account_id"] = steamid
+    #params["min_players"] = 10
+    params.update(kwargs)
+    matchlist = getJson(STEAM_HISTORY_URL, params = params)
+
+    return matchlist["result"]["matches"]
+
+
+def updateMatches(db, account_id, hero_id= 0 ):
+    oldest_match_id = 0
     while 1:
-        matches = getMatchHistory(account_id, date_max = t)
-        t = matches[-1]["start_time"]
+        matches = _getMatchHistory(account_id, hero_id = hero_id, start_at_match_id = oldest_match_id)
+        if len(matches) == 0: 
+            break
+        oldest_match_id = matches[-1]["match_id"]
         #t = getOldestGameTime(account_id)
+        for match in matches:
+            insertMatch(db, match)
         if len(matches) < 100:
             break
-        for match in matches:
-            insertMatch(match)
+
+def getAllMatches(db, account_id):
+
+    db.execute("SELECT hero_id from heros")
+    hero_ids = [hero[0] for hero in db.fetchall()]
+    for hero_id in hero_ids:
+        updateMatches(db, account_id, hero_id)
+
 
 def insertMatchDetails(match):
     #backup = open("matchdetail", 'w')
@@ -288,7 +290,7 @@ def insertMatchDetails(match):
         detailparams[p] = match[p]    
 
     dstring = createNamedUpdate("match_detail", where,  **detailparams)
-    db.run(dstring)
+    db.execute(dstring)
 
     for p in match["players"]:
         where = {"match_id": match["match_id"], "player_id": p["account_id"], "hero_id" : p["hero_id"]}
@@ -303,14 +305,15 @@ def insertMatchDetails(match):
         
         playerparams.update(where)
         pstring = createNamedInsert("played", **playerparams)
-        db.run(pstring)
+        db.execute(pstring)
 
     
 
 
 
 def fillMatchDetails():
-    records = db.all('select match_id from match_detail where radiant_win is NULL')
+    db.execute('select match_id from match_detail where radiant_win is NULL')
+    records = db.fetchall()
     print "{} new matches found".format(len(records))
     counter = 0
     for record in records:
@@ -320,7 +323,7 @@ def fillMatchDetails():
         counter = counter + 1
         
 
-def insertHeroIds():
+def insertHeroIds(db):
     source = "https://raw.github.com/dotabuff/d2vpk/master/dota_pak01/scripts/npc/npc_heroes.txt"
     herolist = getText(source)
     heronames = getTokens(pyparseHelper.heroNameSpec, herolist)
@@ -331,13 +334,13 @@ def insertHeroIds():
         pat = re.findall('[A-z]+', alias)
         return pat
         
-    heronames.remove("Centaur Warchief")
+    heronames.remove("Centaur Warchief") #workaround, file is buggy
 
     for name, id in zip(heronames, heroids):
         #aliases = splitAlias(alias)
         #aliasstring= "\'{" + createValueString(aliases) + "}\'"
         runstring = createInsert('heros', [int(id), wrapString(name)])
-        db.run(runstring)
+        db.execute(runstring)
 
 def getWinrate(records, **kwargs):
     try:
@@ -447,36 +450,44 @@ def rankHeros():
     
 
 if  __name__ == "__main__":
+
+
+    with ConnectionWrapper("dbname=dota user=bxu") as db:
+        #initializations
+        #insertHeroIds(db)
+
+        #account_id = db.one("select player_id from players where LOWER(persona) = 'rainvargus'")
+        bit64 = vanityToSteamId("rainvargus")
+        #insertPlayers(db, [bit64])
+
+        #matches = getMatchHistory(bit64)
+        #print db.fetchall()
+        #matches = getAllMatches(db, bit64)
+        #for match in matches:
+        #    insertMatch(db, match)
+        fillMatchDetails()
+
     #bit64 = stringToSteamId("STEAM_0:0:23599837")
-    #bit64 = vanityToSteamId("rainvargus")
-    account_id = db.one("select player_id from players where LOWER(persona) = 'rainvargus'")
     #print bit64
     #getNameFrom64(bit64)
     #print getNameFrom64(76561198049183649)
     #getFriendList(bit64)
     #friends = getFriendList(bit64)
-    #insertPlayers([bit64])
     
     #insertPlayers(friends[57:])
      
-    #matches = getMatchHistory(account_id)
-    #for match in matches:
-    #    insertMatch(match)
     #t = getOldestGameTime(account_id)
     #matchid = db.one("select match_id from match_detail where start_time = {}".format(t))
     #print t
     #print matchid
     #matchdetails = getMatchDetails(matchid)
     #print matchdetails
-    #getAllMatches(account_id)
     #matches = getMatchHistory(account_id, date_max = 1349382647)
-    #fillMatchDetails()
     #go.db
     #print createNamedInsert("matches", asdf = "bla", blub = 3)
     #print createWhereStrings( asdf = "bla", blub = 3)
-    #insertHeroIds()
     #print createValueString(["rainvargus", "schatten"])
-    print checkWinrate(['rainvargus', 'schatten'], 'drow', False)
+    #print checkWinrate(['rainvargus', 'schatten'], 'drow', False)
     #print checkWinrate(['rainvargus', 'chroniko'], 'outworld_devourer', True)
     #print checkWinrate(['Fire-storm' ], 'Phantom_Assassin')
     #results = checkWinrateAllHeros([ 'rainvargus', 'Fire-storm'], True)
